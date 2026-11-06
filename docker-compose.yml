@@ -1,0 +1,64 @@
+# Lingkungan pengembangan lokal Masri-M
+# Port sengaja dibedakan dari PostgreSQL Windows (5432) agar tidak bentrok.
+name: masrim
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: masrim-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: masrim
+      POSTGRES_PASSWORD: masrim_dev
+      POSTGRES_DB: masrim
+      TZ: Asia/Jakarta
+    ports:
+      - "5433:5432"
+    volumes:
+      - masrim_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U masrim -d masrim"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: masrim-redis
+    restart: unless-stopped
+    ports:
+      - "6380:6379"
+    volumes:
+      - masrim_redisdata:/data
+
+  # Penangkap email lokal: semua email notifikasi terlihat di http://localhost:8025 (tidak terkirim keluar)
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: masrim-mailpit
+    restart: unless-stopped
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+
+  # Penyimpanan file kompatibel S3 — OPSIONAL (tanpa ini file disimpan di folder server/uploads).
+  # Tidak ikut "docker compose up -d"; nyalakan dengan: docker compose --profile s3 up -d
+  # Port 19000/19001 dipakai karena 9000-9001 sering direservasi Windows (Hyper-V / WinNAT).
+  minio:
+    image: minio/minio:latest
+    container_name: masrim-minio
+    profiles: ["s3"]
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: masrim
+      MINIO_ROOT_PASSWORD: masrim_dev_secret
+    ports:
+      - "127.0.0.1:19000:9000"
+      - "127.0.0.1:19001:9001"
+    volumes:
+      - masrim_minio:/data
+
+volumes:
+  masrim_pgdata:
+  masrim_redisdata:
+  masrim_minio:

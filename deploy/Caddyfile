@@ -1,0 +1,64 @@
+# Reverse proxy + HTTPS otomatis (Let's Encrypt) untuk Masri-M.
+# Variabel dari .env (root): DOMAIN, ACME_EMAIL, STATUS_DOMAIN (opsional, untuk Uptime Kuma).
+{
+	email {$ACME_EMAIL}
+	servers {
+		trusted_proxies static private_ranges
+	}
+}
+
+(security_headers) {
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "camera=(self), geolocation=(), microphone=(), payment=()"
+		Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self'; frame-src 'none'; frame-ancestors 'none'; object-src 'none'; base-uri 'self'; form-action 'self' https://www.billplz.com https://www.billplz-sandbox.com; upgrade-insecure-requests"
+		-Server
+		-X-Powered-By
+	}
+}
+
+www.{$DOMAIN} {
+	redir https://{$DOMAIN}{uri} permanent
+}
+
+{$DOMAIN} {
+	import security_headers
+	encode zstd gzip
+	request_body {
+		max_size 12MB
+	}
+	log {
+		output stdout
+		# Token rahasia di URL webhook Biteship disamarkan di log akses
+		format filter {
+			wrap json
+			fields {
+				request>uri regexp "(/api/webhooks/biteship/)[^/?]+" "${1}***"
+			}
+		}
+	}
+
+	# API + webhook gateway (Midtrans, Billplz, Biteship)
+	handle /api/* {
+		reverse_proxy api:4000 {
+			header_up X-Request-Id {http.request.uuid}
+			health_uri /api/health
+			health_interval 30s
+		}
+	}
+
+	# Website & dashboard (file statis dari container web)
+	handle {
+		reverse_proxy web:80
+	}
+}
+
+# Halaman status Uptime Kuma (opsional; aktif bila profil "monitoring" dijalankan)
+{$STATUS_DOMAIN:status.localhost} {
+	import security_headers
+	header Content-Security-Policy "frame-ancestors 'none'"
+	reverse_proxy uptime-kuma:3001
+}

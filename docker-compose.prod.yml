@@ -1,0 +1,179 @@
+# Produksi Masri-M (satu VPS). Panduan lengkap: docs/DEPLOY.md
+#   1. cp deploy/.env.prod.example .env              (domain, password database & MinIO)
+#   2. cp server/.env.example server/.env.production (secret aplikasi, gateway, WhatsApp)
+#   3. docker compose -f docker-compose.prod.yml up -d --build
+#   Monitoring (Uptime Kuma): tambahkan --profile monitoring
+name: masrim-prod
+
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "20m", max-file: "5" }
+
+# Proses di dalam container tidak bisa menaikkan hak akses (setuid/setgid)
+x-secure: &secure
+  security_opt: ["no-new-privileges:true"]
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports: ["80:80", "443:443", "443:443/udp"]
+    environment:
+      DOMAIN: ${DOMAIN:?isi DOMAIN di .env}
+      ACME_EMAIL: ${ACME_EMAIL:?isi ACME_EMAIL di .env}
+      STATUS_DOMAIN: ${STATUS_DOMAIN:-status.localhost}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on: [api, web]
+    <<: *secure
+    mem_limit: 256m
+    logging: *logging
+
+  web:
+    build: { context: ., dockerfile: deploy/Dockerfile.web }
+    image: masrim-web:${APP_VERSION:-latest}
+    restart: unless-stopped
+    expose: ["80"]
+    <<: *secure
+    mem_limit: 128m
+    logging: *logging
+
+  api:
+    build: { context: ., dockerfile: deploy/Dockerfile.api, args: { APP_VERSION: "${APP_VERSION:-dev}" } }
+    image: masrim-api:${APP_VERSION:-latest}
+    restart: unless-stopped
+    env_file: server/.env.production
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://${POSTGRES_USER:-masrim}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-masrim}
+      REDIS_URL: redis://:${REDIS_PASSWORD:?isi REDIS_PASSWORD di .env}@redis:6379
+      TRUST_PROXY: "1"
+      ENABLE_DEV_SIMULATION: "false"
+      PUBLIC_WEB_URL: https://${DOMAIN}
+      API_PUBLIC_URL: https://${DOMAIN}
+      ALLOWED_ORIGINS: https://${DOMAIN},https://www.${DOMAIN}
+      STORAGE_DRIVER: s3
+      S3_ENDPOINT: http://minio:9000
+      S3_BUCKET: ${S3_BUCKET:-masrim}
+      # Akun MinIO khusus aplikasi (hanya bucket masrim) — dibuat oleh layanan minio-init. Bila kosong memakai akun root.
+      S3_ACCESS_KEY: ${MINIO_APP_USER:-${MINIO_ROOT_USER}}
+      S3_SECRET_KEY: ${MINIO_APP_PASSWORD:-${MINIO_ROOT_PASSWORD}}
+      S3_SSE: "false"
+      S3_CREATE_BUCKET: "false"
+      BACKUP_STATUS_FILE: /backups/last-success
+      APP_VERSION: ${APP_VERSION:-dev}
+    volumes: ["./backups:/backups:ro"]
+    expose: ["4000"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_started }
+      minio-init: { condition: service_completed_successfully }
+    <<: *secure
+    # API berjalan sebagai user node: tanpa kapabilitas Linux, sistem file read-only (hanya /tmp yang bisa ditulis)
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs: ["/tmp:size=64m"]
+    mem_limit: 1g
+    pids_limit: 512
+    logging: *logging
+
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-masrim}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?isi POSTGRES_PASSWORD di .env}
+      POSTGRES_DB: ${POSTGRES_DB:-masrim}
+      TZ: Asia/Jakarta
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-masrim}"], interval: 5s, retries: 20 }
+    shm_size: 256mb
+    <<: *secure
+    logging: *logging
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru", "--requirepass", "${REDIS_PASSWORD:?isi REDIS_PASSWORD di .env}"]
+    volumes: [redisdata:/data]
+    <<: *secure
+    mem_limit: 256m
+    logging: *logging
+
+  # Penyimpanan file (foto produk, KTP/KYC, bukti) — tidak dibuka ke internet; diakses lewat API.
+  minio:
+    # MinIO komunitas tidak lagi merilis image baru sejak akhir 2025; versi dikunci ke rilis stabil.
+    # Driver S3 aplikasi juga cocok dengan Cloudflare R2 / Wasabi / AWS S3 bila kelak ingin pindah (cukup ubah env).
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?isi MINIO_ROOT_USER di .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?isi MINIO_ROOT_PASSWORD di .env}
+    volumes: [miniodata:/data]
+    ports: ["127.0.0.1:9001:9001"]   # konsol MinIO hanya lewat SSH tunnel
+    healthcheck: { test: ["CMD", "mc", "ready", "local"], interval: 10s, retries: 10 }
+    <<: *secure
+    mem_limit: 1g
+    logging: *logging
+
+  # Sekali jalan: buat bucket + akun MinIO terbatas untuk API (prinsip hak akses minimum)
+  minio-init:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    restart: "no"
+    <<: *secure
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_APP_USER: ${MINIO_APP_USER:-}
+      MINIO_APP_PASSWORD: ${MINIO_APP_PASSWORD:-}
+      S3_BUCKET: ${S3_BUCKET:-masrim}
+    volumes: ["./deploy/minio-init.sh:/minio-init.sh:ro"]
+    entrypoint: ["/bin/sh", "/minio-init.sh"]
+    depends_on: { minio: { condition: service_healthy } }
+    logging: *logging
+
+  # Cadangan harian 02:00 WIB (database + file), uji restore tiap Minggu, salinan off-site opsional
+  backup:
+    build: { context: ., dockerfile: deploy/Dockerfile.backup }
+    image: masrim-backup:latest
+    restart: unless-stopped
+    environment:
+      PGHOST: postgres
+      PGUSER: ${POSTGRES_USER:-masrim}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB:-masrim}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      S3_BUCKET: ${S3_BUCKET:-masrim}
+      BACKUP_KEEP_DAYS: ${BACKUP_KEEP_DAYS:-14}
+      BACKUP_KEEP_MONTHS: ${BACKUP_KEEP_MONTHS:-12}
+      RCLONE_REMOTE: ${RCLONE_REMOTE:-}
+      BACKUP_AGE_RECIPIENT: ${BACKUP_AGE_RECIPIENT:-}
+      TZ: Asia/Jakarta
+    volumes:
+      - ./backups:/backups
+      - ./deploy/rclone:/root/.config/rclone
+    depends_on: { postgres: { condition: service_healthy }, minio: { condition: service_healthy } }
+    <<: *secure
+    mem_limit: 512m
+    logging: *logging
+
+  # Pemantauan uptime + notifikasi (WhatsApp/Telegram/email). Jalankan dengan --profile monitoring
+  uptime-kuma:
+    image: louislam/uptime-kuma:1
+    profiles: [monitoring]
+    restart: unless-stopped
+    volumes: [kumadata:/app/data]
+    expose: ["3001"]
+    logging: *logging
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:
+  caddy_data:
+  caddy_config:
+  kumadata:

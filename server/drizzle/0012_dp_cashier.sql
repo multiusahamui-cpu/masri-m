@@ -1,0 +1,1 @@
+ALTER TABLE "credit_applications" ADD COLUMN "delivery_plan" jsonb;
